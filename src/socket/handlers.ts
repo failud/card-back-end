@@ -70,6 +70,8 @@ function autoPass(roomCode: string): void {
   const player = gs.players[gs.currentPlayerIndex];
   if (!player) return;
 
+  let roundWasReset = false;
+
   // If no current play, auto-play lowest single
   if (!gs.currentPlay || gs.currentPlay.type === 'pass') {
     if (player.hand.length > 0) {
@@ -95,8 +97,8 @@ function autoPass(roomCode: string): void {
     if (result.state) {
       room.gameState = result.state;
       broadcastToRoom(roomCode, 'player_passed', { playerId: player.id, playerName: player.name });
-      if (gs.roundHistory.length === 0 && gs.currentPlay === null) {
-        // Round reset
+      roundWasReset = gs.roundHistory.length === 0 && gs.currentPlay === null;
+      if (roundWasReset) {
         broadcastToRoom(roomCode, 'new_round', {
           leaderId: gs.roundLeaderId,
           centralCard: gs.centralCard,
@@ -106,7 +108,23 @@ function autoPass(roomCode: string): void {
   }
 
   checkEndGame(roomCode);
-  advanceTurn(roomCode);
+  if (gs.winner) return;
+
+  if (roundWasReset) {
+    // processPass already advanced currentPlayerIndex for the new round
+    const nextPlayer = gs.players[gs.currentPlayerIndex];
+    if (nextPlayer && !nextPlayer.isOut) {
+      broadcastToRoom(roomCode, 'your_turn', {
+        playerId: nextPlayer.id,
+        playerName: nextPlayer.name,
+        currentPlay: gs.currentPlay,
+        timer: gs.timer,
+      });
+      startTimer(roomCode);
+    }
+  } else {
+    advanceTurn(roomCode);
+  }
 }
 
 // ── Turn Management ──
@@ -148,6 +166,9 @@ function checkEndGame(roomCode: string): void {
       processNormalWin(gs, gs.winner, room.config.coinValue);
     }
 
+    // Start ready phase for potential new round
+    room.readyPlayers = new Set();
+
     broadcastToRoom(roomCode, 'game_over', {
       winner: gs.winner,
       winnerName: gs.players.find((p) => p.id === gs.winner)?.name,
@@ -155,6 +176,11 @@ function checkEndGame(roomCode: string): void {
       payouts: gs.payouts,
       winDetail: gs.winDetail,
       coinValue: room.config.coinValue,
+    });
+
+    // Broadcast initial empty ready state
+    broadcastToRoom(roomCode, 'ready_state', {
+      readyPlayers: [] as string[],
     });
 
     // Save to history for all players
@@ -210,6 +236,170 @@ async function saveGameHistory(roomCode: string): Promise<void> {
   }
 }
 
+// ── Start Game Flow (reusable for new games in same room) ──
+
+function startGameFlow(roomCode: string): void {
+  const room = getRoom(roomCode);
+  if (!room) return;
+
+  // Mark all players as connected
+  room.players.forEach((p) => { p.connected = true; });
+
+  // Init game
+  const playerInfos = room.players.map((p) => ({ id: p.id, name: p.name }));
+  const gs = initGameState(playerInfos, room.config.coinValue);
+  room.gameState = gs;
+
+  // Check instant wins for all players
+  const instantWinPlayers: { playerId: string; results: ReturnType<typeof checkInstantWin> }[] = [];
+  for (const player of gs.players) {
+    const results = checkInstantWin(player.hand, gs.centralCard);
+    if (results.length > 0) instantWinPlayers.push({ playerId: player.id, results });
+  }
+
+  // If anyone has instant win → game over with the first one
+  if (instantWinPlayers.length > 0) {
+    const firstWinner = instantWinPlayers[0];
+    const winner = gs.players.find((p) => p.id === firstWinner.playerId);
+    if (winner) {
+      const result = processInstantWin(gs, firstWinner.playerId);
+      if (result.state) {
+        room.gameState = result.state;
+        room.phase = 'game-over';
+
+        room.gameState.payouts = calculatePayout(
+          firstWinner.playerId, gs.players,
+          room.gameState.scores?.[firstWinner.playerId] || 0,
+          room.config.coinValue, true
+        );
+
+        broadcastToRoom(roomCode, 'game_over', {
+          winner: firstWinner.playerId,
+          winnerName: winner.name,
+          scores: room.gameState.scores,
+          payouts: room.gameState.payouts,
+          winDetail: room.gameState.winDetail,
+          coinValue: room.config.coinValue,
+        });
+        saveGameHistory(roomCode).catch(() => {});
+        return;
+      }
+    }
+  }
+
+  // No instant win → normal flow
+  room.phase = 'ready-check';
+
+  broadcastToRoom(roomCode, 'game_started', {
+    opponents: gs.players.map((p) => ({
+      id: p.id, name: p.name, handSize: p.hand.length,
+    })),
+    centralCard: gs.centralCard,
+    coinValue: room.config.coinValue,
+    playerOrder: gs.players.map((p) => p.id),
+  });
+
+  for (const player of room.players) {
+    const gp = gs.players.find((p) => p.id === player.id);
+    if (gp && player.socketId) {
+      sendToPlayer(player.socketId, 'hand_dealt', { cards: gp.hand });
+      sendToPlayer(player.socketId, 'instant_win_check', { results: [] });
+    }
+  }
+
+  // Move to first turn after brief delay
+  setTimeout(() => {
+    const r = getRoom(roomCode);
+    if (!r || !r.gameState || r.phase === 'game-over') return;
+    r.phase = 'playing';
+    advanceTurn(roomCode);
+  }, 2000);
+}
+
+// ── Reconnection State ──
+
+function sendReconnectState(roomCode: string, socket: Socket, userId: string): void {
+  const room = getRoom(roomCode);
+  if (!room || !room.gameState) return;
+
+  const gs = room.gameState;
+
+  // For game-over, just send the final state — no need to replay the board
+  if (room.phase === 'game-over') {
+    sendToPlayer(socket.id, 'game_over', {
+      winner: gs.winner,
+      winnerName: gs.players.find((p) => p.id === gs.winner)?.name,
+      scores: gs.scores,
+      payouts: gs.payouts,
+      winDetail: gs.winDetail,
+      coinValue: room.config.coinValue,
+    });
+    return;
+  }
+
+  // Send game_started with original hand sizes (9 each) so replaying
+  // history reduces them to the correct current values
+  sendToPlayer(socket.id, 'game_started', {
+    opponents: gs.players.map((p) => ({
+      id: p.id, name: p.name, handSize: 9,
+    })),
+    centralCard: gs.centralCard,
+    coinValue: room.config.coinValue,
+    playerOrder: gs.players.map((p) => p.id),
+  });
+
+  // Send reconnecting player's current hand
+  const player = gs.players.find((p) => p.id === userId);
+  if (player) {
+    sendToPlayer(socket.id, 'hand_dealt', { cards: player.hand });
+
+    // Check if instant win is still available (ready-check phase)
+    const instantResults = checkInstantWin(player.hand, gs.centralCard);
+    const hasPendingInstantWin = room.phase === 'ready-check' && instantResults.length > 0;
+    sendToPlayer(socket.id, 'instant_win_check', {
+      results: hasPendingInstantWin ? instantResults : [],
+    });
+  }
+
+  // Replay full game history so the UI builds correctly (hand sizes
+  // auto-adjust via play_made handler reducing from 9)
+  for (const record of gs.gameHistory) {
+    if (record.type === 'pass') {
+      sendToPlayer(socket.id, 'player_passed', {
+        playerId: record.playerId,
+        playerName: getPlayerName(roomCode, record.playerId) || record.playerId,
+      });
+    } else {
+      sendToPlayer(socket.id, 'play_made', {
+        playerId: record.playerId,
+        playerName: getPlayerName(roomCode, record.playerId) || record.playerId,
+        cards: record.cards,
+        type: record.type,
+      });
+    }
+  }
+
+  // Current round state for playing phase
+  if (room.phase === 'playing') {
+    if (!gs.currentPlay && gs.roundLeaderId) {
+      sendToPlayer(socket.id, 'new_round', {
+        leaderId: gs.roundLeaderId,
+        centralCard: gs.centralCard,
+      });
+    }
+
+    const currentPlayer = gs.players[gs.currentPlayerIndex];
+    sendToPlayer(socket.id, 'your_turn', {
+      playerId: currentPlayer.id,
+      playerName: currentPlayer.name,
+      currentPlay: gs.currentPlay,
+      timer: gs.timer,
+    });
+
+    sendToPlayer(socket.id, 'timer_sync', { remaining: gs.timer });
+  }
+}
+
 // ── Register Handlers ──
 
 export function registerHandlers(socket: Socket): void {
@@ -250,6 +440,11 @@ export function registerHandlers(socket: Socket): void {
 
     ack?.({ ok: true, roomCode });
     broadcastToRoom(roomCode, 'room_state', { room: sanitizeRoom(result) });
+
+    // If reconnecting to an active game, send full state to this player
+    if (result.phase !== 'lobby' && result.gameState) {
+      sendReconnectState(roomCode, socket, userId);
+    }
   });
 
   socket.on('leave_room', (data: { roomCode: string }) => {
@@ -268,82 +463,7 @@ export function registerHandlers(socket: Socket): void {
     if (room.hostId !== userId) { ack?.({ error: 'Only host can start' }); return; }
     if (room.players.length < 3) { ack?.({ error: 'Need at least 3 players' }); return; }
 
-    // Mark all players as connected
-    room.players.forEach((p) => { p.connected = true; });
-
-    // Init game
-    const playerInfos = room.players.map((p) => ({ id: p.id, name: p.name }));
-    const gs = initGameState(playerInfos, room.config.coinValue);
-    room.gameState = gs;
-
-    // Check instant wins for all players
-    const instantWinPlayers: { playerId: string; results: ReturnType<typeof checkInstantWin> }[] = [];
-    for (const player of gs.players) {
-      const results = checkInstantWin(player.hand, gs.centralCard);
-      if (results.length > 0) instantWinPlayers.push({ playerId: player.id, results });
-    }
-
-    // If anyone has instant win → game over with the first one
-    if (instantWinPlayers.length > 0) {
-      const firstWinner = instantWinPlayers[0];
-      const winner = gs.players.find((p) => p.id === firstWinner.playerId);
-      if (winner) {
-        const result = processInstantWin(gs, firstWinner.playerId);
-        if (result.state) {
-          room.gameState = result.state;
-          room.phase = 'game-over';
-
-          // Recalc payouts with coin value
-          room.gameState.payouts = calculatePayout(
-            firstWinner.playerId, gs.players,
-            room.gameState.scores?.[firstWinner.playerId] || 0,
-            room.config.coinValue, true
-          );
-
-          broadcastToRoom(roomCode, 'game_over', {
-            winner: firstWinner.playerId,
-            winnerName: winner.name,
-            scores: room.gameState.scores,
-            payouts: room.gameState.payouts,
-            winDetail: room.gameState.winDetail,
-            coinValue: room.config.coinValue,
-          });
-          saveGameHistory(roomCode).catch(() => {});
-          return;
-        }
-      }
-    }
-
-    // No instant win → normal flow
-    room.phase = 'ready-check';
-
-    // Send public state to all
-    broadcastToRoom(roomCode, 'game_started', {
-      opponents: gs.players.map((p) => ({
-        id: p.id, name: p.name, handSize: p.hand.length,
-      })),
-      centralCard: gs.centralCard,
-      coinValue: room.config.coinValue,
-      playerOrder: gs.players.map((p) => p.id),
-    });
-
-    // Send private hand to each player
-    for (const player of room.players) {
-      const gp = gs.players.find((p) => p.id === player.id);
-      if (gp && player.socketId) {
-        sendToPlayer(player.socketId, 'hand_dealt', { cards: gp.hand });
-        sendToPlayer(player.socketId, 'instant_win_check', { results: [] });
-      }
-    }
-
-    // Move to first turn after brief delay
-    setTimeout(() => {
-      const r = getRoom(roomCode);
-      if (!r || !r.gameState || r.phase === 'game-over') return;
-      r.phase = 'playing';
-      advanceTurn(roomCode);
-    }, 2000);
-
+    startGameFlow(roomCode);
     ack?.({ ok: true });
   });
 
@@ -401,7 +521,8 @@ export function registerHandlers(socket: Socket): void {
     broadcastToRoom(roomCode, 'player_passed', { playerId: userId, playerName: currentPlayer.name });
 
     // Check round reset
-    if (gs.roundHistory.length === 0 && gs.currentPlay === null) {
+    const roundWasReset = gs.roundHistory.length === 0 && gs.currentPlay === null;
+    if (roundWasReset) {
       broadcastToRoom(roomCode, 'new_round', {
         leaderId: gs.roundLeaderId,
         centralCard: gs.centralCard,
@@ -409,7 +530,24 @@ export function registerHandlers(socket: Socket): void {
     }
 
     ack?.({ ok: true });
-    advanceTurn(roomCode);
+    checkEndGame(roomCode);
+    if (gs.winner) return;
+
+    if (roundWasReset) {
+      // processPass already advanced currentPlayerIndex for the new round
+      const nextPlayer = gs.players[gs.currentPlayerIndex];
+      if (nextPlayer && !nextPlayer.isOut) {
+        broadcastToRoom(roomCode, 'your_turn', {
+          playerId: nextPlayer.id,
+          playerName: nextPlayer.name,
+          currentPlay: gs.currentPlay,
+          timer: gs.timer,
+        });
+        startTimer(roomCode);
+      }
+    } else {
+      advanceTurn(roomCode);
+    }
   });
 
   socket.on('declare_instant_win', (data: { roomCode: string }, ack?: AckCallback) => {
@@ -434,6 +572,7 @@ export function registerHandlers(socket: Socket): void {
 
     room.phase = 'game-over';
     if (room.timerInterval) { clearInterval(room.timerInterval); room.timerInterval = null; }
+    room.readyPlayers = new Set();
 
     broadcastToRoom(roomCode, 'game_over', {
       winner: userId,
@@ -444,8 +583,36 @@ export function registerHandlers(socket: Socket): void {
       coinValue: room.config.coinValue,
     });
 
+    broadcastToRoom(roomCode, 'ready_state', {
+      readyPlayers: [] as string[],
+    });
+
     ack?.({ ok: true });
     saveGameHistory(roomCode).catch(() => {});
+  });
+
+  socket.on('player_ready', (data: { roomCode: string }, ack?: AckCallback) => {
+    const { roomCode } = data;
+    const room = getRoom(roomCode);
+    if (!room || room.phase !== 'game-over') {
+      ack?.({ error: 'No game-over in progress' });
+      return;
+    }
+
+    room.readyPlayers.add(userId);
+
+    const readyList = Array.from(room.readyPlayers);
+    broadcastToRoom(roomCode, 'ready_state', { readyPlayers: readyList });
+
+    // Check if all connected players are ready
+    const connectedPlayers = room.players.filter((p) => p.connected);
+    const allReady = connectedPlayers.every((p) => room.readyPlayers.has(p.id));
+
+    if (allReady && connectedPlayers.length >= 2) {
+      startGameFlow(roomCode);
+    }
+
+    ack?.({ ok: true });
   });
 
   socket.on('disconnect', () => {

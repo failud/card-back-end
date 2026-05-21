@@ -90,6 +90,7 @@ export interface GameRoom {
   phase: RoomPhase;
   gameState: GameState | null;
   timerInterval: ReturnType<typeof setInterval> | null;
+  readyPlayers: Set<string>;
 }
 
 // ── Room Manager ──
@@ -116,6 +117,7 @@ export function createRoom(hostId: string, hostName: string, config: RoomConfig)
     phase: 'lobby',
     gameState: null,
     timerInterval: null,
+    readyPlayers: new Set(),
   };
   rooms.set(code, room);
   return room;
@@ -124,14 +126,17 @@ export function createRoom(hostId: string, hostName: string, config: RoomConfig)
 export function joinRoom(roomCode: string, playerId: string, playerName: string): GameRoom | { error: string } {
   const room = rooms.get(roomCode.toUpperCase());
   if (!room) return { error: 'Room not found' };
-  if (room.phase !== 'lobby') return { error: 'Game already started' };
-  if (room.players.length >= room.config.playerCount) return { error: 'Room is full' };
 
+  // Reconnecting player — allow regardless of phase
   const existing = room.players.find((p) => p.id === playerId);
   if (existing) {
     existing.connected = true;
     return room;
   }
+
+  // New player — only during lobby
+  if (room.phase !== 'lobby') return { error: 'Game already started' };
+  if (room.players.length >= room.config.playerCount) return { error: 'Room is full' };
 
   room.players.push({ id: playerId, name: playerName, socketId: '', connected: true });
   return room;

@@ -411,16 +411,10 @@ export function processPass(state: GameState, playerId: string): { error?: strin
   // Check if round ends
   if (shouldEndRound(state.roundHistory, state.players, playerId)) {
     const lastNonPass = [...state.roundHistory].reverse().find((r) => r.type !== 'pass');
-    if (lastNonPass) {
-      const winner = state.players.find((p) => p.id === lastNonPass.playerId);
-      if (winner) {
-        winner.lockedOut = true; // winner locked for next round
-      }
-    }
 
     // Reset round
     const winnerIndex = state.players.findIndex((p) => p.id === lastNonPass?.playerId);
-    state.currentPlayerIndex = winnerIndex >= 0 ? getNextPlayerIndex(state.players, (winnerIndex - 1 + state.players.length) % state.players.length) : getNextPlayerIndex(state.players, state.currentPlayerIndex);
+    state.currentPlayerIndex = winnerIndex >= 0 ? winnerIndex : getNextPlayerIndex(state.players, state.currentPlayerIndex);
     state.roundHistory = [];
     state.currentPlay = null;
     state.leadingSuit = null;
