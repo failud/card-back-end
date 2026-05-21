@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Add-Type -AssemblyName System.IO.Compression.FileSystem; $zip = [System.IO.Compression.ZipFile]::OpenRead\\(\"F:\\\\card\\\\Koi_Rules_Manual.docx\"\\); $entry = $zip.Entries | Where-Object { $_.Name -eq \"document.xml\" }; $stream = $entry.Open\\(\\); $reader = New-Object System.IO.StreamReader\\($stream\\); $xml = $reader.ReadToEnd\\(\\); $reader.Dispose\\(\\); $zip.Dispose\\(\\); $xml)"
+    ]
+  }
+}
