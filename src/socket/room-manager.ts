@@ -86,11 +86,14 @@ export interface GameRoom {
   code: string;
   hostId: string;
   config: RoomConfig;
+  isPrivate: boolean;
   players: RoomPlayer[];
   phase: RoomPhase;
   gameState: GameState | null;
   timerInterval: ReturnType<typeof setInterval> | null;
   readyPlayers: Set<string>;
+  pausedTimerRemaining: number | null;
+  roomTTLTimeout: ReturnType<typeof setTimeout> | null;
 }
 
 // ── Room Manager ──
@@ -107,17 +110,20 @@ function generateCode(): string {
   return code;
 }
 
-export function createRoom(hostId: string, hostName: string, config: RoomConfig): GameRoom {
+export function createRoom(hostId: string, hostName: string, config: RoomConfig, isPrivate = false): GameRoom {
   const code = generateCode();
   const room: GameRoom = {
     code,
     hostId,
     config,
+    isPrivate,
     players: [{ id: hostId, name: hostName, socketId: '', connected: true }],
     phase: 'lobby',
     gameState: null,
     timerInterval: null,
     readyPlayers: new Set(),
+    pausedTimerRemaining: null,
+    roomTTLTimeout: null,
   };
   rooms.set(code, room);
   return room;
@@ -148,13 +154,16 @@ export function leaveRoom(roomCode: string, playerId: string): GameRoom | null {
 
   room.players = room.players.filter((p) => p.id !== playerId);
 
-  if (room.players.length === 0 || room.hostId === playerId) {
-    rooms.delete(room.code);
+  // No players left — delete room
+  if (room.players.length === 0) {
     if (room.timerInterval) clearInterval(room.timerInterval);
+    if (room.roomTTLTimeout) clearTimeout(room.roomTTLTimeout);
+    rooms.delete(room.code);
     return null;
   }
 
-  if (room.players.length > 0 && room.hostId === playerId) {
+  // Transfer host if the leaving player was host
+  if (room.hostId === playerId) {
     room.hostId = room.players[0].id;
   }
 
@@ -167,8 +176,33 @@ export function getRoom(roomCode: string): GameRoom | undefined {
 
 export function deleteRoom(roomCode: string): void {
   const room = rooms.get(roomCode.toUpperCase());
-  if (room?.timerInterval) clearInterval(room.timerInterval);
+  if (room) {
+    if (room.timerInterval) clearInterval(room.timerInterval);
+    if (room.roomTTLTimeout) clearTimeout(room.roomTTLTimeout);
+  }
   rooms.delete(roomCode.toUpperCase());
+}
+
+export function startRoomTTL(roomCode: string): void {
+  const room = rooms.get(roomCode.toUpperCase());
+  if (!room) return;
+  if (room.roomTTLTimeout) clearTimeout(room.roomTTLTimeout);
+
+  room.roomTTLTimeout = setTimeout(() => {
+    const r = rooms.get(roomCode.toUpperCase());
+    if (r && r.players.every((p) => !p.connected)) {
+      if (r.timerInterval) clearInterval(r.timerInterval);
+      rooms.delete(roomCode.toUpperCase());
+    }
+  }, 5 * 60 * 1000);
+}
+
+export function clearRoomTTL(roomCode: string): void {
+  const room = rooms.get(roomCode.toUpperCase());
+  if (room?.roomTTLTimeout) {
+    clearTimeout(room.roomTTLTimeout);
+    room.roomTTLTimeout = null;
+  }
 }
 
 export function updatePlayerSocket(roomCode: string, playerId: string, socketId: string): void {
@@ -182,8 +216,34 @@ export function setPlayerDisconnected(roomCode: string, playerId: string): GameR
   const room = rooms.get(roomCode.toUpperCase());
   if (!room) return null;
   const player = room.players.find((p) => p.id === playerId);
-  if (player) player.connected = false;
+  if (!player) return room;
+  player.connected = false;
+
+  // Transfer host if disconnected player was the host
+  if (room.hostId === playerId) {
+    const nextConnected = room.players.find((p) => p.id !== playerId && p.connected);
+    if (nextConnected) {
+      room.hostId = nextConnected.id;
+    }
+  }
+
   return room;
+}
+
+export function getPublicRooms(): Pick<GameRoom, 'code' | 'hostId' | 'config' | 'players' | 'phase'>[] {
+  const result: Pick<GameRoom, 'code' | 'hostId' | 'config' | 'players' | 'phase'>[] = [];
+  for (const room of rooms.values()) {
+    if (room.phase === 'lobby' && !room.isPrivate && room.players.length < room.config.playerCount) {
+      result.push({
+        code: room.code,
+        hostId: room.hostId,
+        config: room.config,
+        players: room.players.map((p) => ({ id: p.id, name: p.name, socketId: '', connected: p.connected })),
+        phase: room.phase,
+      });
+    }
+  }
+  return result;
 }
 
 export function setPlayerConnected(roomCode: string, playerId: string, socketId: string): GameRoom | null {

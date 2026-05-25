@@ -3,6 +3,7 @@ import { getIO } from './index';
 import {
   createRoom, joinRoom, leaveRoom, getRoom, deleteRoom,
   updatePlayerSocket, setPlayerDisconnected,
+  startRoomTTL, clearRoomTTL,
 } from './room-manager';
 import {
   initGameState, processPlay, processPass, processInstantWin,
@@ -50,13 +51,21 @@ function startTimer(roomCode: string): void {
       return;
     }
 
+    // Pause timer if all players are disconnected
+    const hasConnected = r.players.some((p) => p.connected);
+    if (!hasConnected) {
+      r.pausedTimerRemaining = r.gameState.timer;
+      if (r.timerInterval) clearInterval(r.timerInterval);
+      r.timerInterval = null;
+      return;
+    }
+
     r.gameState.timer--;
     broadcastToRoom(roomCode, 'timer_sync', { remaining: r.gameState.timer });
 
     if (r.gameState.timer <= 0) {
       clearInterval(r.timerInterval!);
       r.timerInterval = null;
-      // Auto-pass
       autoPass(roomCode);
     }
   }, 1000);
@@ -337,32 +346,21 @@ function sendReconnectState(roomCode: string, socket: Socket, userId: string): v
     return;
   }
 
-  // Send game_started with original hand sizes (9 each) so replaying
+  // Send game_started with initial hand sizes so replaying
   // history reduces them to the correct current values
+  const initialHandSize = gs.players[0]?.hand.length ?? 9;
   sendToPlayer(socket.id, 'game_started', {
     opponents: gs.players.map((p) => ({
-      id: p.id, name: p.name, handSize: 9,
+      id: p.id, name: p.name, handSize: initialHandSize,
     })),
     centralCard: gs.centralCard,
     coinValue: room.config.coinValue,
     playerOrder: gs.players.map((p) => p.id),
+    isReconnect: true,
   });
 
-  // Send reconnecting player's current hand
-  const player = gs.players.find((p) => p.id === userId);
-  if (player) {
-    sendToPlayer(socket.id, 'hand_dealt', { cards: player.hand });
-
-    // Check if instant win is still available (ready-check phase)
-    const instantResults = checkInstantWin(player.hand, gs.centralCard);
-    const hasPendingInstantWin = room.phase === 'ready-check' && instantResults.length > 0;
-    sendToPlayer(socket.id, 'instant_win_check', {
-      results: hasPendingInstantWin ? instantResults : [],
-    });
-  }
-
   // Replay full game history so the UI builds correctly (hand sizes
-  // auto-adjust via play_made handler reducing from 9)
+  // auto-adjust via play_made handler reducing from initial count)
   for (const record of gs.gameHistory) {
     if (record.type === 'pass') {
       sendToPlayer(socket.id, 'player_passed', {
@@ -377,6 +375,20 @@ function sendReconnectState(roomCode: string, socket: Socket, userId: string): v
         type: record.type,
       });
     }
+  }
+
+  // Send reconnecting player's current hand AFTER history replay
+  // so play_made reductions don't corrupt the already-correct hand
+  const player = gs.players.find((p) => p.id === userId);
+  if (player) {
+    sendToPlayer(socket.id, 'hand_dealt', { cards: player.hand });
+
+    // Check if instant win is still available (ready-check phase)
+    const instantResults = checkInstantWin(player.hand, gs.centralCard);
+    const hasPendingInstantWin = room.phase === 'ready-check' && instantResults.length > 0;
+    sendToPlayer(socket.id, 'instant_win_check', {
+      results: hasPendingInstantWin ? instantResults : [],
+    });
   }
 
   // Current round state for playing phase
@@ -406,15 +418,15 @@ export function registerHandlers(socket: Socket): void {
   const userId = socket.data.userId as string;
   if (!userId) return;
 
-  socket.on('create_room', (data: { playerCount: number; coinValue: number }, ack?: AckCallback) => {
-    const { playerCount, coinValue } = data;
+  socket.on('create_room', (data: { playerCount: number; coinValue: number; isPrivate?: boolean }, ack?: AckCallback) => {
+    const { playerCount, coinValue, isPrivate } = data;
     if (playerCount < 3 || playerCount > 5) {
       ack?.({ error: 'Player count must be 3-5' });
       return;
     }
 
     const userName = socket.data.userName || getPlayerName('', userId) || 'Host';
-    const room = createRoom(userId, userName, { playerCount, coinValue });
+    const room = createRoom(userId, userName, { playerCount, coinValue }, isPrivate);
     updatePlayerSocket(room.code, userId, socket.id);
     socket.join(room.code);
 
@@ -437,6 +449,16 @@ export function registerHandlers(socket: Socket): void {
 
     updatePlayerSocket(roomCode, userId, socket.id);
     socket.join(roomCode);
+
+    // Clear room TTL since someone rejoined
+    clearRoomTTL(roomCode);
+
+    // Resume paused timer if applicable
+    if (result.phase === 'playing' && result.gameState && result.pausedTimerRemaining !== null) {
+      result.gameState.timer = result.pausedTimerRemaining;
+      result.pausedTimerRemaining = null;
+      startTimer(roomCode);
+    }
 
     ack?.({ ok: true, roomCode });
     broadcastToRoom(roomCode, 'room_state', { room: sanitizeRoom(result) });
@@ -616,9 +638,6 @@ export function registerHandlers(socket: Socket): void {
   });
 
   socket.on('disconnect', () => {
-    // Find rooms this player is in
-    // Walk through rooms (function available in closure)
-    // For now: broadcast disconnect to the room
     socket.rooms.forEach((r) => {
       if (r !== socket.id) {
         const room = setPlayerDisconnected(r, userId);
@@ -627,6 +646,14 @@ export function registerHandlers(socket: Socket): void {
             playerId: userId,
             playerName: room.players.find((p) => p.id === userId)?.name || '',
           });
+          // Broadcast full room state so clients see new hostId
+          broadcastToRoom(r, 'room_state', { room: sanitizeRoom(room) });
+
+          // Start room TTL if all players are now disconnected
+          const hasConnected = room.players.some((p) => p.connected);
+          if (!hasConnected) {
+            startRoomTTL(r);
+          }
         }
       }
     });
@@ -641,6 +668,7 @@ function sanitizeRoom(room: ReturnType<typeof getRoom>) {
     code: room.code,
     hostId: room.hostId,
     config: room.config,
+    isPrivate: room.isPrivate,
     players: room.players.map((p) => ({ id: p.id, name: p.name, connected: p.connected })),
     phase: room.phase,
   };

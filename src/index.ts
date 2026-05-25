@@ -6,6 +6,7 @@ import { connectDB } from './db';
 import authRoutes from './routes/auth';
 import historyRoutes from './routes/history';
 import profileRoutes from './routes/profile';
+import roomRoutes from './routes/rooms';
 import { createSocketServer, getIO } from './socket';
 import { registerHandlers } from './socket/handlers';
 
@@ -19,6 +20,7 @@ async function main() {
   app.use('/api/auth', authRoutes);
   app.use('/api/history', historyRoutes);
   app.use('/api/profile', profileRoutes);
+  app.use('/api/rooms', roomRoutes);
 
   app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok' });
