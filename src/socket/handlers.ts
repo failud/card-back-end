@@ -408,8 +408,8 @@ export function registerHandlers(socket: Socket): void {
 
   socket.on('create_room', (data: { playerCount: number; coinValue: number }, ack?: AckCallback) => {
     const { playerCount, coinValue } = data;
-    if (playerCount < 3 || playerCount > 4) {
-      ack?.({ error: 'Player count must be 3-4' });
+    if (playerCount < 3 || playerCount > 5) {
+      ack?.({ error: 'Player count must be 3-5' });
       return;
     }
 
