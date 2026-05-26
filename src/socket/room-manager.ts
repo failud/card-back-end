@@ -94,6 +94,7 @@ export interface GameRoom {
   readyPlayers: Set<string>;
   pausedTimerRemaining: number | null;
   roomTTLTimeout: ReturnType<typeof setTimeout> | null;
+  lastWinnerId: string | null;
 }
 
 // ── Room Manager ──
@@ -110,6 +111,13 @@ function generateCode(): string {
   return code;
 }
 
+export function getRoomByHost(hostId: string): GameRoom | undefined {
+  for (const room of rooms.values()) {
+    if (room.hostId === hostId) return room;
+  }
+  return undefined;
+}
+
 export function createRoom(hostId: string, hostName: string, config: RoomConfig, isPrivate = false): GameRoom {
   const code = generateCode();
   const room: GameRoom = {
@@ -124,6 +132,7 @@ export function createRoom(hostId: string, hostName: string, config: RoomConfig,
     readyPlayers: new Set(),
     pausedTimerRemaining: null,
     roomTTLTimeout: null,
+    lastWinnerId: null,
   };
   rooms.set(code, room);
   return room;

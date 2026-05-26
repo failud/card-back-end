@@ -3,7 +3,7 @@ import { getIO } from './index';
 import {
   createRoom, joinRoom, leaveRoom, getRoom, deleteRoom,
   updatePlayerSocket, setPlayerDisconnected,
-  startRoomTTL, clearRoomTTL,
+  startRoomTTL, clearRoomTTL, getRoomByHost,
 } from './room-manager';
 import {
   initGameState, processPlay, processPass, processInstantWin,
@@ -79,59 +79,41 @@ function autoPass(roomCode: string): void {
   const player = gs.players[gs.currentPlayerIndex];
   if (!player) return;
 
-  let roundWasReset = false;
-
-  // If no current play, auto-play lowest single
-  if (!gs.currentPlay || gs.currentPlay.type === 'pass') {
-    if (player.hand.length > 0) {
-      // Play lowest single
-      const lowest = [...player.hand].sort((a, b) => {
-        const RANK_VALUES: Record<string, number> = { '3':0,'4':1,'5':2,'6':3,'7':4,'8':5,'9':6,'10':7,J:8,Q:9,K:10,A:11,'2':12 };
-        return (RANK_VALUES[String(a.rank)] || 0) - (RANK_VALUES[String(b.rank)] || 0);
-      });
-      const result = processPlay(gs, player.id, [lowest[0].id]);
-      if (result.state) {
-        room.gameState = result.state;
-        broadcastToRoom(roomCode, 'play_made', {
-          playerId: player.id,
-          playerName: player.name,
-          cards: [lowest[0]],
-          type: 'single',
-        });
-      }
-    }
-  } else {
-    // Pass
+  // If there's a current play, pass normally
+  if (gs.currentPlay && gs.currentPlay.type !== 'pass') {
     const result = processPass(gs, player.id);
     if (result.state) {
       room.gameState = result.state;
       broadcastToRoom(roomCode, 'player_passed', { playerId: player.id, playerName: player.name });
-      roundWasReset = gs.roundHistory.length === 0 && gs.currentPlay === null;
+
+      const roundWasReset = gs.roundHistory.length === 0 && gs.currentPlay === null;
       if (roundWasReset) {
         broadcastToRoom(roomCode, 'new_round', {
           leaderId: gs.roundLeaderId,
           centralCard: gs.centralCard,
         });
       }
-    }
-  }
 
-  checkEndGame(roomCode);
-  if (gs.winner) return;
+      checkEndGame(roomCode);
+      if (gs.winner) return;
 
-  if (roundWasReset) {
-    // processPass already advanced currentPlayerIndex for the new round
-    const nextPlayer = gs.players[gs.currentPlayerIndex];
-    if (nextPlayer && !nextPlayer.isOut) {
-      broadcastToRoom(roomCode, 'your_turn', {
-        playerId: nextPlayer.id,
-        playerName: nextPlayer.name,
-        currentPlay: gs.currentPlay,
-        timer: gs.timer,
-      });
-      startTimer(roomCode);
+      if (roundWasReset) {
+        const nextPlayer = gs.players[gs.currentPlayerIndex];
+        if (nextPlayer && !nextPlayer.isOut) {
+          broadcastToRoom(roomCode, 'your_turn', {
+            playerId: nextPlayer.id,
+            playerName: nextPlayer.name,
+            currentPlay: gs.currentPlay,
+            timer: gs.timer,
+          });
+          startTimer(roomCode);
+        }
+      } else {
+        advanceTurn(roomCode);
+      }
     }
   } else {
+    // Leading the round — can't pass, so skip turn (advance to next player)
     advanceTurn(roomCode);
   }
 }
@@ -174,6 +156,9 @@ function checkEndGame(roomCode: string): void {
       gs.payouts = {};
       processNormalWin(gs, gs.winner, room.config.coinValue);
     }
+
+    // Remember last winner for next game
+    room.lastWinnerId = gs.winner;
 
     // Start ready phase for potential new round
     room.readyPlayers = new Set();
@@ -256,7 +241,7 @@ function startGameFlow(roomCode: string): void {
 
   // Init game
   const playerInfos = room.players.map((p) => ({ id: p.id, name: p.name }));
-  const gs = initGameState(playerInfos, room.config.coinValue);
+  const gs = initGameState(playerInfos, room.config.coinValue, room.lastWinnerId);
   room.gameState = gs;
 
   // Check instant wins for all players
@@ -282,6 +267,7 @@ function startGameFlow(roomCode: string): void {
           room.config.coinValue, true
         );
 
+        room.lastWinnerId = firstWinner.playerId;
         broadcastToRoom(roomCode, 'game_over', {
           winner: firstWinner.playerId,
           winnerName: winner.name,
@@ -425,6 +411,12 @@ export function registerHandlers(socket: Socket): void {
       return;
     }
 
+    // Each player can only host one room at a time
+    if (getRoomByHost(userId)) {
+      ack?.({ error: 'You already have a room' });
+      return;
+    }
+
     const userName = socket.data.userName || getPlayerName('', userId) || 'Host';
     const room = createRoom(userId, userName, { playerCount, coinValue }, isPrivate);
     updatePlayerSocket(room.code, userId, socket.id);
@@ -484,6 +476,11 @@ export function registerHandlers(socket: Socket): void {
     if (!room) { ack?.({ error: 'Room not found' }); return; }
     if (room.hostId !== userId) { ack?.({ error: 'Only host can start' }); return; }
     if (room.players.length < 3) { ack?.({ error: 'Need at least 3 players' }); return; }
+
+    // Check all non-host players are ready
+    const nonHost = room.players.filter((p) => p.id !== room.hostId && p.connected);
+    const allReady = nonHost.length === 0 || nonHost.every((p) => room.readyPlayers.has(p.id));
+    if (!allReady) { ack?.({ error: 'Not all players are ready' }); return; }
 
     startGameFlow(roomCode);
     ack?.({ ok: true });
@@ -616,23 +613,20 @@ export function registerHandlers(socket: Socket): void {
   socket.on('player_ready', (data: { roomCode: string }, ack?: AckCallback) => {
     const { roomCode } = data;
     const room = getRoom(roomCode);
-    if (!room || room.phase !== 'game-over') {
-      ack?.({ error: 'No game-over in progress' });
+    if (!room || (room.phase !== 'game-over' && room.phase !== 'lobby')) {
+      ack?.({ error: 'Cannot ready in current phase' });
       return;
     }
 
-    room.readyPlayers.add(userId);
+    // Toggle ready
+    if (room.readyPlayers.has(userId)) {
+      room.readyPlayers.delete(userId);
+    } else {
+      room.readyPlayers.add(userId);
+    }
 
     const readyList = Array.from(room.readyPlayers);
     broadcastToRoom(roomCode, 'ready_state', { readyPlayers: readyList });
-
-    // Check if all connected players are ready
-    const connectedPlayers = room.players.filter((p) => p.connected);
-    const allReady = connectedPlayers.every((p) => room.readyPlayers.has(p.id));
-
-    if (allReady && connectedPlayers.length >= 2) {
-      startGameFlow(roomCode);
-    }
 
     ack?.({ ok: true });
   });
@@ -671,5 +665,6 @@ function sanitizeRoom(room: ReturnType<typeof getRoom>) {
     isPrivate: room.isPrivate,
     players: room.players.map((p) => ({ id: p.id, name: p.name, connected: p.connected })),
     phase: room.phase,
+    readyPlayers: Array.from(room.readyPlayers),
   };
 }

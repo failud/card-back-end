@@ -327,7 +327,7 @@ export function getNextPlayerIndex(players: GamePlayer[], currentIndex: number):
 
 // ── Game State Init ──
 
-export function initGameState(players: { id: string; name: string }[], coinValue: number): GameState {
+export function initGameState(players: { id: string; name: string }[], coinValue: number, lastWinnerId?: string | null): GameState {
   const deck = shuffle(createDeck());
   const { hands, centralCard } = deal(deck, players.length);
 
@@ -341,17 +341,26 @@ export function initGameState(players: { id: string; name: string }[], coinValue
     isOut: false,
   }));
 
+  // If there was a previous winner, they lead the first round
+  let startIndex = gamePlayers.length - 1;
+  if (lastWinnerId) {
+    const winnerIdx = gamePlayers.findIndex((p) => p.id === lastWinnerId);
+    if (winnerIdx >= 0) {
+      startIndex = ((winnerIdx - 1) + gamePlayers.length) % gamePlayers.length;
+    }
+  }
+
   return {
     players: gamePlayers,
     centralCard,
     deck: [],
     // Start at last player so first advanceTurn wraps to player 0
-    currentPlayerIndex: gamePlayers.length - 1,
+    currentPlayerIndex: startIndex,
     roundHistory: [],
     currentPlay: null,
     leadingSuit: null,
     gameHistory: [],
-    roundLeaderId: null,
+    roundLeaderId: lastWinnerId || null,
     winner: null,
     scores: null,
     payouts: null,
@@ -375,6 +384,13 @@ export function processPlay(state: GameState, playerId: string, cardIds: string[
 
   if (!canBeat({ playerId, cards, type: playType }, state.currentPlay)) {
     return { error: 'Cannot beat current play' };
+  }
+
+  // Check: cannot leave a 2 as the last card (cannot go out on 2s nor leave only 2s)
+  const remaining = player.hand.filter((c) => !cardIds.includes(c.id));
+  if ((remaining.length === 0 && cards.some((c) => c.rank === '2')) ||
+      (remaining.length > 0 && remaining.every((c) => c.rank === '2'))) {
+    return { error: 'Cannot leave 2 as last card' };
   }
 
   // Remove cards from hand
